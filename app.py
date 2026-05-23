@@ -208,6 +208,10 @@ raw_df, cleaned_df, labeling_method = load_cleaned_dataset(uploaded_file)
 st.session_state['labeling_method'] = labeling_method
 
 if cleaned_df is not None:
+    # 2. Calculate dynamic sample statistics custom variables
+    total_unique_firms = cleaned_df['Company Code'].nunique()
+    total_firm_year_obs = len(cleaned_df)
+    
     # Run modular ML pipeline
     pipeline = run_ml_pipeline(cleaned_df)
     
@@ -336,6 +340,25 @@ if cleaned_df is not None:
             fig_after.update_traces(textposition='outside')
             fig_after.update_yaxes(showgrid=True, gridcolor='#e2e8f0', zeroline=False)
             st.plotly_chart(fig_after, use_container_width=True)
+
+        # 3. Display the exact sample statistics dynamically before the dataset preview
+        st.write("")
+        st.markdown("### 📊 Sample Statistics Summary")
+        col_stat1, col_stat2 = st.columns(2)
+        with col_stat1:
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-title">Total Unique Firms (Companies)</div>
+                    <div class="metric-value">{total_unique_firms}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col_stat2:
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-title">Total Firm-Year Observations</div>
+                    <div class="metric-value">{total_firm_year_obs}</div>
+                </div>
+            """, unsafe_allow_html=True)
 
         st.markdown("### 🔍 Cleaned Dataset Preview")
         # Missing values profile
