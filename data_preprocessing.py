@@ -16,8 +16,8 @@ RATIOS = [
     'Cash Flow to Total Debt'
 ]
 
-# Helper columns used to determine distress under the dynamic rule
-HELPER_COLS = ['Total Assets', 'Total Liabilities', 'Net Income (or Net Profit)']
+# Helper columns used to determine distress under the correct rule
+HELPER_COLS = ['Total Assets', 'Total Liabilities', 'Operating Profit (EBIT)', 'Operating Cash Flow']
 
 def clean_numeric(val):
     """
@@ -49,7 +49,7 @@ def clean_numeric(val):
 def load_and_clean_data(file_path_or_buffer=None):
     """
     Loads raw Excel/CSV dataset, applies deep numeric cleaning to all features, 
-    and handles missing target variables by applying robust dynamic labeling fallback rules.
+    and handles missing target variables by applying the correct research methodology labeling rules.
     
     Returns:
         raw_df (pd.DataFrame): Loaded dataframe before cleaning.
@@ -95,22 +95,33 @@ def load_and_clean_data(file_path_or_buffer=None):
     )
 
     if is_target_empty:
-        # Check if helper columns are present for the premium dynamic rule
-        missing_helpers = [h for h in HELPER_COLS if h not in cleaned_df.columns]
-        if not missing_helpers:
-            cleaned_df[target_col] = np.where(
-                (cleaned_df['Total Assets'] < cleaned_df['Total Liabilities']) | 
-                ((cleaned_df['Net Income (or Net Profit)'] < 0) & (cleaned_df['Current Ratio'] < 1.0)),
-                1.0, 0.0
-            )
-            labeling_method = "Dynamic Fallback Rule: (Assets < Liabilities) OR (Net Income < 0 AND Current Ratio < 1)"
-        else:
-            # If assets/liabilities are missing, fall back to simple negative ROA or high debt ratio
-            cleaned_df[target_col] = np.where(
-                (cleaned_df['Return on Assets'] < 0.0) | (cleaned_df['Debt Ratio'] > 0.8),
-                1.0, 0.0
-            )
-            labeling_method = "Basic Fallback Rule: (ROA < 0) OR (Debt Ratio > 0.8)"
+        # Sort chronologically per company code before applying shifted/rolling conditions
+        cleaned_df = cleaned_df.sort_values(by=['Company Code', 'Financial year']).reset_index(drop=True)
+        
+        # 1. Total Assets < Total Liabilities (Negative Net Assets) in Year t
+        net_assets_neg = cleaned_df['Total Assets'] < cleaned_df['Total Liabilities']
+        
+        # 2. 3 consecutive years negative Operating Cash Flow (OCF < 0 in t, t-1, t-2)
+        ocf = cleaned_df['Operating Cash Flow']
+        ocf_t0 = ocf < 0
+        ocf_t1 = cleaned_df.groupby('Company Code')['Operating Cash Flow'].shift(1) < 0
+        ocf_t2 = cleaned_df.groupby('Company Code')['Operating Cash Flow'].shift(2) < 0
+        three_years_neg_ocf = ocf_t0 & ocf_t1 & ocf_t2
+        
+        # 3. 3 consecutive years negative Operating Profit (EBIT < 0 in t, t-1, t-2)
+        ebit = cleaned_df['Operating Profit (EBIT)']
+        ebit_t0 = ebit < 0
+        ebit_t1 = cleaned_df.groupby('Company Code')['Operating Profit (EBIT)'].shift(1) < 0
+        ebit_t2 = cleaned_df.groupby('Company Code')['Operating Profit (EBIT)'].shift(2) < 0
+        three_years_neg_ebit = ebit_t0 & ebit_t1 & ebit_t2
+        
+        # A firm is classified as distressed (1.0) if it satisfies any one of the three criteria
+        cleaned_df[target_col] = np.where(
+            net_assets_neg | three_years_neg_ocf | three_years_neg_ebit,
+            1.0, 0.0
+        )
+        
+        labeling_method = "Methodology Distress Rules: (Negative Net Assets in t) OR (3 Yrs Consecutive OCF < 0) OR (3 Yrs Consecutive Operating Losses)"
     else:
         labeling_method = "Original Dataset Target Labels"
 
@@ -118,8 +129,8 @@ def load_and_clean_data(file_path_or_buffer=None):
 
 def preprocess_and_split_data(cleaned_df):
     """
-    Separates features and targets, splits into 80% train and 20% test sets, 
-    and applies strict leakage-free preprocessing pipelines (Imputation, SMOTE, and Scaling).
+    Separates features and targets, shifts features chronologically to use Year t-1 ratios to predict Year t distress,
+    splits into 80% train and 20% test sets, and applies strict leakage-free preprocessing pipelines.
     
     Returns:
         X_train_res (pd.DataFrame): Scaled, SMOTE-balanced training features.
@@ -129,25 +140,42 @@ def preprocess_and_split_data(cleaned_df):
         scaler (StandardScaler): Fitted scaler object.
         imputer (SimpleImputer): Fitted imputer object.
     """
-    # 1. Extract 15 features and 1 target variable
-    X = cleaned_df[RATIOS].copy()
-    y = cleaned_df['Target variable (0.1)'].copy()
+    # 1. Ensure cleaned_df is sorted chronologically per company code
+    cleaned_df = cleaned_df.sort_values(by=['Company Code', 'Financial year']).reset_index(drop=True)
     
-    # 2. Stratified Train-Test Split (80% Train, 20% Test)
+    # 2. Extract targets at Year t
+    y_raw = cleaned_df['Target variable (0.1)'].copy()
+    
+    # 3. Lag the 15 financial ratios (shift by 1 year) within each company group
+    # This represents X_{t-1} used to predict y_t
+    X_lagged = cleaned_df.groupby('Company Code')[RATIOS].shift(1)
+    
+    # 4. We drop rows where the lagged features are completely missing (i.e. first year of data per company, like 2018)
+    # The first year has no t-1 year data, so all its ratios will be NaN after shift.
+    # We identify these rows where ALL 15 ratios are NaN.
+    first_year_mask = X_lagged.isna().all(axis=1)
+    
+    # Keep only rows where lagged features are NOT completely missing
+    # This drops 2018 records (the first year) completely from training/testing.
+    X_aligned = X_lagged[~first_year_mask].copy()
+    y_aligned = y_raw[~first_year_mask].copy()
+    
+    # 5. Stratified Train-Test Split (80% Train, 20% Test)
+    # Using stratify=y_aligned ensures that both partitions have similar proportions of distress
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
+        X_aligned, y_aligned, test_size=0.20, random_state=42, stratify=y_aligned
     )
     
-    # 3. Fit Imputer only on training set features, transform both
+    # 6. Fit Imputer only on training set features, transform both
     imputer = SimpleImputer(strategy='median')
     X_train_imputed = pd.DataFrame(imputer.fit_transform(X_train), columns=RATIOS, index=X_train.index)
     X_test_imputed = pd.DataFrame(imputer.transform(X_test), columns=RATIOS, index=X_test.index)
     
-    # 4. Apply SMOTE strictly on training set only (resolves class imbalance)
+    # 7. Apply SMOTE strictly on training set only (resolves class imbalance)
     smote = SMOTE(random_state=42)
     X_train_res_raw, y_train_res = smote.fit_resample(X_train_imputed, y_train)
     
-    # 5. Fit StandardScaler only on resampled training set features, transform both
+    # 8. Fit StandardScaler only on resampled training set features, transform both
     scaler = StandardScaler()
     X_train_res_arr = scaler.fit_transform(X_train_res_raw)
     X_test_scaled_arr = scaler.transform(X_test_imputed)

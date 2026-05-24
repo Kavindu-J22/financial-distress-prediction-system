@@ -137,7 +137,7 @@ def run_ml_pipeline(cleaned_df):
     if cleaned_df is None:
         return None
         
-    # 1. Preprocess and Split Data (Strict Leakage Prevention)
+    # 1. Preprocess and Split Data (Strict Leakage Prevention with Lagging & Dropping)
     X_train_res, X_test_scaled, y_train_res, y_test, scaler, imputer = preprocess_and_split_data(cleaned_df)
     
     # 2. Train and Evaluate Models
@@ -145,14 +145,20 @@ def run_ml_pipeline(cleaned_df):
         X_train_res, X_test_scaled, y_train_res, y_test
     )
     
-    # 3. Recalculate raw training and testing partitions for class distribution counts
-    X = cleaned_df[RATIOS].copy()
-    y = cleaned_df['Target variable (0.1)'].copy()
-    X_train, X_test, y_train, y_test_raw = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
+    # 3. For class distribution counts, we retrieve the y_train counts before SMOTE
+    # We repeat the split locally on aligned data to get exact counts before oversampling
+    cleaned_df_sorted = cleaned_df.sort_values(by=['Company Code', 'Financial year']).reset_index(drop=True)
+    X_lagged = cleaned_df_sorted.groupby('Company Code')[RATIOS].shift(1)
+    y_raw = cleaned_df_sorted['Target variable (0.1)'].copy()
+    first_year_mask = X_lagged.isna().all(axis=1)
+    X_aligned = X_lagged[~first_year_mask]
+    y_aligned = y_raw[~first_year_mask]
+    
+    _, _, y_train_before_smote, _ = train_test_split(
+        X_aligned, y_aligned, test_size=0.20, random_state=42, stratify=y_aligned
     )
     
-    class_counts_before = y_train.value_counts().to_dict()
+    class_counts_before = y_train_before_smote.value_counts().to_dict()
     class_counts_after = y_train_res.value_counts().to_dict()
     
     # Pack exactly in the form predicted by app.py UI
@@ -161,10 +167,9 @@ def run_ml_pipeline(cleaned_df):
         'imputer': imputer,
         'lr_model': lr_model,
         'rf_model': rf_model,
-        'X_train_raw': X_train,
         'X_train_res': X_train_res,
         'y_train_res': y_train_res,
-        'X_test': X_test,
+        'X_test_scaled': X_test_scaled,
         'y_test': y_test,
         'report_lr': metrics['report_lr'],
         'report_rf': metrics['report_rf'],
@@ -271,10 +276,10 @@ if cleaned_df is not None:
                 <div class="metric-card" style="border-left: 4px solid #f59e0b;">
                     <div class="metric-title">Target Labeling Mode</div>
                     <div class="metric-value" style="font-size:1.15rem; font-weight:700; height:45px; display:flex; align-items:center; justify-content:center; color:#b45309;">
-                        {"Fallback Dynamic Rule" if "Fallback" in st.session_state['labeling_method'] else "Preset Excel Labels"}
+                        Methodology Rules
                     </div>
                     <div style="font-size:0.78rem; color:#64748b; margin-top:5px; font-style:italic;">
-                        {st.session_state['labeling_method']}
+                        Assets &lt; Liabilities OR 3yrs consecutive OCF &lt; 0 OR EBIT &lt; 0
                     </div>
                 </div>
             """, unsafe_allow_html=True)
@@ -283,7 +288,7 @@ if cleaned_df is not None:
         
         # Class distribution charts (Before vs After SMOTE)
         st.markdown("### ⚖️ Target Class Balancing Analysis (SMOTE Pipeline)")
-        st.info("SMOTE (Synthetic Minority Over-sampling Technique) is applied strictly on the **Training Set** to synthesize new minority instances, addressing severe class imbalance and ensuring unbiased training.")
+        st.warning("⚠️ **Early Warning System Alignment:** Ratios are lagged by 1 year ($X_{t-1} \\rightarrow Y_t$) to predict next-year distress. Consequently, the first observation year (2018) is dropped from ML partitions since it lacks preceding historical features. SMOTE is applied strictly to the remaining training partition.")
         
         col_chart1, col_chart2 = st.columns(2)
         
@@ -296,7 +301,7 @@ if cleaned_df is not None:
             })
             fig_before = px.bar(
                 df_before, x='Status', y='Count',
-                title="Class Balance in Training Partition BEFORE SMOTE",
+                title="Class Balance in Aligned Partition (2019-2024) BEFORE SMOTE",
                 color='Status',
                 color_discrete_map={'Healthy (0)': '#636EFA', 'Distressed (1)': '#EF553B'},
                 text='Count'
@@ -304,7 +309,7 @@ if cleaned_df is not None:
             fig_before.update_layout(
                 font_family="Inter",
                 title_font_family="Montserrat",
-                title_font_size=15,
+                title_font_size=14,
                 showlegend=False,
                 plot_bgcolor='rgba(0,0,0,0)',
                 paper_bgcolor='rgba(0,0,0,0)',
@@ -331,7 +336,7 @@ if cleaned_df is not None:
             fig_after.update_layout(
                 font_family="Inter",
                 title_font_family="Montserrat",
-                title_font_size=15,
+                title_font_size=14,
                 showlegend=False,
                 plot_bgcolor='rgba(0,0,0,0)',
                 paper_bgcolor='rgba(0,0,0,0)',
@@ -372,10 +377,9 @@ if cleaned_df is not None:
                     st.success("No missing values in raw predictor ratios!")
             with col_imput_info:
                 st.markdown("**Preprocessing Strategy Details (Modular Strict Architecture):**")
-                st.write("1. **Imputation:** Missing predictor cells are filled using **Median Imputation** based on the training features distribution.")
-                st.write("2. **Splitting:** 80% train and 20% test subsets are split using **Stratification** on the target class to maintain class balance in both partitions.")
-                st.write("3. **Scaling:** Scaled using a **StandardScaler** to ensure all 15 indicators have a mean of 0 and unit variance, preventing high-leverage ratios from dominating.")
-                st.write("4. **Zero-Leakage Guarantee:** `SimpleImputer` and `StandardScaler` are fitted strictly on the training partition to ensure zero test partition leakage.")
+                st.write("1. **Target Distress Rules:** Derived at Year $t$ if Total Assets &lt; Total Liabilities, OR 3 consecutive years of negative operating cash flows, OR 3 consecutive years of operating losses (EBIT &lt; 0).")
+                st.write("2. **Early Warning Lagging:** Ratios are shifted by 1 year per company ($X_{t-1} \\rightarrow Y_t$). The first observation year (2018) is dropped during preprocessing because it lacks preceding ratios.")
+                st.write("3. **Imputation & Scaling:** Median Imputation and StandardScaler are fit *only* on the training set to prevent leakages.")
 
         st.dataframe(cleaned_df.head(100), use_container_width=True)
 
@@ -521,6 +525,7 @@ if cleaned_df is not None:
     with tab3:
         st.markdown("### 🔮 Real-Time Corporate Distress Predictor")
         st.write("Enter financial ratios manually or load a real corporate profile from the CSE dataset below to generate an instant, scaled predictive evaluation using the trained Random Forest ensemble model.")
+        st.info("💡 **Methodology Check:** In accordance with the early warning framework, input ratios entered below represent **Year t-1** (current ratios) to predict the **Year t** (following year) corporate distress risk.")
 
         st.markdown("#### 🏢 Option A: Load Profile from CSE Dataset")
         col_comp_sel, col_year_sel, col_btn_sel = st.columns([2, 1, 1])
@@ -530,25 +535,32 @@ if cleaned_df is not None:
             selected_comp = st.selectbox("Select Corporate Code (Ticker)", comp_list)
         
         with col_year_sel:
-            year_list = sorted(cleaned_df[cleaned_df['Company Code'] == selected_comp]['Financial year'].unique())
-            selected_yr = st.selectbox("Select Year", year_list)
+            # We retrieve years available for prediction. We must predict Year t (2019-2024) using Year t-1 (2018-2023)
+            all_years = sorted(cleaned_df[cleaned_df['Company Code'] == selected_comp]['Financial year'].unique())
+            pred_years = [y for y in all_years if y > all_years[0]]  # Exclude 2018 since 2017 ratios are missing
+            selected_yr = st.selectbox("Select Target Prediction Year (t)", pred_years)
             
         with col_btn_sel:
             st.write("<div style='height: 28px;'></div>", unsafe_allow_html=True)
             if st.button("🔌 Load Corporate Profile", use_container_width=True):
-                # Fetch row data
-                profile_row = cleaned_df[
+                # Fetch row data for Year t-1 to predict Year t
+                preceding_yr = selected_yr - 1
+                profile_rows = cleaned_df[
                     (cleaned_df['Company Code'] == selected_comp) & 
-                    (cleaned_df['Financial year'] == selected_yr)
-                ].iloc[0]
+                    (cleaned_df['Financial year'] == preceding_yr)
+                ]
                 
-                # Load values to session state
-                for r in RATIOS:
-                    val = profile_row[r]
-                    st.session_state[r] = float(val) if not pd.isna(val) else 0.0
-                
-                st.toast(f"Profile loaded successfully for {selected_comp} ({selected_yr})!", icon="✅")
-                st.rerun()
+                if not profile_rows.empty:
+                    profile_row = profile_rows.iloc[0]
+                    # Load values to session state
+                    for r in RATIOS:
+                        val = profile_row[r]
+                        st.session_state[r] = float(val) if not pd.isna(val) else 0.0
+                    
+                    st.toast(f"Ratios for preceding year {preceding_yr} loaded to predict distress in target year {selected_yr}!", icon="✅")
+                    st.rerun()
+                else:
+                    st.error(f"No preceding year data ({preceding_yr}) found in dataset for {selected_comp} to predict Year {selected_yr} distress.")
 
         st.write("")
         st.markdown("#### 🖊️ Option B: Manually Adjust Ratios / Edit Input Form")
@@ -558,7 +570,7 @@ if cleaned_df is not None:
             col_p, col_l, col_c = st.columns(3)
             
             with col_p:
-                st.markdown("##### 📈 Profitability & Leverage")
+                st.markdown("##### 📈 Profitability & Leverage (Year t-1)")
                 roa_val = st.number_input("Return on Assets (ROA)", value=st.session_state['Return on Assets'], format="%.5f")
                 opm_val = st.number_input("Operating Profit Margin (OPM)", value=st.session_state['Operating Profit Margin'], format="%.5f")
                 roe_val = st.number_input("Return on Equity (ROE)", value=st.session_state['Return on Equity'], format="%.5f")
@@ -566,7 +578,7 @@ if cleaned_df is not None:
                 debt_val = st.number_input("Debt Ratio", value=st.session_state['Debt Ratio'], format="%.5f")
 
             with col_l:
-                st.markdown("##### 💧 Liquidity & Efficiency")
+                st.markdown("##### 💧 Liquidity & Efficiency (Year t-1)")
                 cr_val = st.number_input("Current Ratio (CR)", value=st.session_state['Current Ratio'], format="%.5f")
                 qr_val = st.number_input("Quick Ratio (QR)", value=st.session_state['Quick Ratio'], format="%.5f")
                 wcta_val = st.number_input("Working Capital to Total Assets", value=st.session_state['Working Capital to Total Assets'], format="%.5f")
@@ -574,7 +586,7 @@ if cleaned_df is not None:
                 ctr_val = st.number_input("Capital Turnover Ratio (CTR)", value=st.session_state['Capital Turnover Ratio'], format="%.5f")
 
             with col_c:
-                st.markdown("##### 💸 Operating Cash Flow Indicators")
+                st.markdown("##### 💸 Operating Cash Flow Indicators (Year t-1)")
                 cffoni_val = st.number_input("Cash Flow to Net Income", value=st.session_state['Cash Flow to Net Income'], format="%.5f")
                 cffotl_val = st.number_input("Cash Flow to Total Liabilities", value=st.session_state['Cash Flow to Total Liabilities'], format="%.5f")
                 cffota_val = st.number_input("Cash Flow to Total Assets", value=st.session_state['Cash Flow to Total Assets'], format="%.5f")
@@ -582,7 +594,7 @@ if cleaned_df is not None:
                 cffotd_val = st.number_input("Cash Flow to Total Debt", value=st.session_state['Cash Flow to Total Debt'], format="%.5f")
 
             st.write("")
-            submit_btn = st.form_submit_button("🔮 Predict Distress Risk Profile", use_container_width=True)
+            submit_btn = st.form_submit_button("🔮 Predict Year t Distress Risk Profile", use_container_width=True)
 
         if submit_btn:
             # Construct a row with the values matching the ratio keys exactly
@@ -619,7 +631,7 @@ if cleaned_df is not None:
             col_res, col_gauge = st.columns([1.5, 1])
             
             with col_res:
-                st.markdown("### 🏁 Model Evaluation Result")
+                st.markdown("### 🏁 Model Evaluation Result (Prediction for Year t)")
                 if prediction == 1:
                     st.markdown(f"""
                         <div class="prediction-distress">
@@ -639,7 +651,7 @@ if cleaned_df is not None:
                         </div>
                     """, unsafe_allow_html=True)
                     
-                st.markdown("#### 📝 Input Ratio Summary")
+                st.markdown("#### 📝 Input Ratio Summary (Year t-1)")
                 st.markdown(f"""
                     * **Profitability:** ROA: `{roa_val:.4%}` | OPM: `{opm_val:.4%}` | ROE: `{roe_val:.4%}`
                     * **Solvency/Leverage:** Debt Ratio: `{debt_val:.4%}` | Leverage: `{lev_val:.2f}`
